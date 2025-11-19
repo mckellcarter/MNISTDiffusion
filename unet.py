@@ -24,7 +24,7 @@ class ConvBnSiLu(nn.Module):
 
 class ResidualBottleneck(nn.Module):
     '''
-    shufflenet_v2 basic unit(https://arxiv.org/pdf/1807.11164.pdf)
+    shufflenet_v2 basic unit(https://arxiv.org/pdf/1807.11164.pdf; Fig. 3C with additional processing on branch 1)
     '''
     def __init__(self,in_channels,out_channels):
         super().__init__()
@@ -42,7 +42,6 @@ class ResidualBottleneck(nn.Module):
         x1,x2=x.chunk(2,dim=1)
         x=torch.cat([self.branch1(x1),self.branch2(x2)],dim=1)
         x=self.channel_shuffle(x) #shuffle two branches
-
         return x
 
 class ResidualDownsample(nn.Module):
@@ -96,7 +95,6 @@ class EncoderBlock(nn.Module):
         if t is not None:
             x=self.time_mlp(x_shortcut,t)
         x=self.conv1(x)
-
         return [x,x_shortcut]
         
 class DecoderBlock(nn.Module):
@@ -128,34 +126,39 @@ class Unet(nn.Module):
         assert isinstance(dim_mults,(list,tuple))
         assert base_dim%2==0 
 
-        channels=self._cal_channels(base_dim,dim_mults)
+        self.channels=self._cal_channels(base_dim,dim_mults)
 
         self.init_conv=ConvBnSiLu(in_channels,base_dim,3,1,1)
         self.time_embedding=nn.Embedding(timesteps,time_embedding_dim)
 
-        self.encoder_blocks=nn.ModuleList([EncoderBlock(c[0],c[1],time_embedding_dim) for c in channels])
-        self.decoder_blocks=nn.ModuleList([DecoderBlock(c[1],c[0],time_embedding_dim) for c in channels[::-1]])
+        self.encoder_blocks=nn.ModuleList([EncoderBlock(c[0],c[1],time_embedding_dim) for c in self.channels])
+        self.decoder_blocks=nn.ModuleList([DecoderBlock(c[1],c[0],time_embedding_dim) for c in self.channels[::-1]])
     
-        self.mid_block=nn.Sequential(*[ResidualBottleneck(channels[-1][1],channels[-1][1]) for i in range(2)],
-                                        ResidualBottleneck(channels[-1][1],channels[-1][1]//2))
+        self.mid_block=nn.Sequential(*[ResidualBottleneck(self.channels[-1][1],self.channels[-1][1]) for i in range(2)],
+                                        ResidualBottleneck(self.channels[-1][1],self.channels[-1][1]//2))
 
-        self.final_conv=nn.Conv2d(in_channels=channels[0][0]//2,out_channels=out_channels,kernel_size=1)
+        self.final_conv=nn.Conv2d(in_channels=self.channels[0][0]//2,out_channels=out_channels,kernel_size=1)
 
     def forward(self,x,t=None):
-        x=self.init_conv(x)
-        if t is not None:
+        x=self.init_conv(x)  #input convolution (ConvBnSiLu)
+        
+        if t is not None: #time embeddings if a timepoint is given
             t=self.time_embedding(t)
-        encoder_shortcuts=[]
-        for encoder_block in self.encoder_blocks:
-            x,x_shortcut=encoder_block(x,t)
-            encoder_shortcuts.append(x_shortcut)
-        x=self.mid_block(x)
-        encoder_shortcuts.reverse()
-        for decoder_block,shortcut in zip(self.decoder_blocks,encoder_shortcuts):
-            x=decoder_block(x,shortcut,t)
-        x=self.final_conv(x)
+        
+        #skip residual connections and continued x processing
+        encoder_shortcuts=[] #list of residuals 
+        for encoder_block in self.encoder_blocks: #for each encoder block (one for the each dim mult, kindof)
+            x,x_shortcut=encoder_block(x,t) #run the encoder block at a specific diffusion time (can ignore time with None)
+            encoder_shortcuts.append(x_shortcut) #add the returned residual output to a list of skips 
+        
+        x=self.mid_block(x) #run middle blocks sequentially
+        encoder_shortcuts.reverse() #flip list so early residuals are connected to late decoders 
 
-        return x
+        for decoder_block,shortcut in zip(self.decoder_blocks,encoder_shortcuts): #for each decoder, run it with the matched residual
+            x=decoder_block(x,shortcut,t)  #run the decoder
+        x=self.final_conv(x) #conv to final image output resolution
+
+        return x #return only main image 
 
     def _cal_channels(self,base_dim,dim_mults):
         dims=[base_dim*x for x in dim_mults]

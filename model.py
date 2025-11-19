@@ -3,6 +3,7 @@ import torch
 import math
 from unet import Unet
 from tqdm import tqdm
+import os 
 
 class MNISTDiffusion(nn.Module):
     def __init__(self,image_size,in_channels,time_embedding_dim=256,timesteps=1000,base_dim=32,dim_mults= [1, 2, 4, 8]):
@@ -26,28 +27,50 @@ class MNISTDiffusion(nn.Module):
 
     def forward(self,x,noise):
         # x:NCHW
-        t=torch.randint(0,self.timesteps,(x.shape[0],)).to(x.device)
-        x_t=self._forward_diffusion(x,t,noise)
-        pred_noise=self.model(x_t,t)
+        t=torch.randint(0,self.timesteps,(x.shape[0],)).to(x.device) #pick a random time point to predict for each sample 
+        x_t=self._forward_diffusion(x,t,noise) #generate noised image based on diffusion model for time t 
+        pred_noise=self.model(x_t,t) #predict the noise in the image (x_t) at time t using the neural network (e.g., Unet)
 
         return pred_noise
 
     @torch.no_grad()
-    def sampling(self,n_samples,clipped_reverse_diffusion=True,device="cuda"):
-        x_t=torch.randn((n_samples,self.in_channels,self.image_size,self.image_size)).to(device)
+    def sampling(self,n_samples,clipped_reverse_diffusion=True,device="cuda", interp=False, noise_seed=None):
+        if noise_seed is None: 
+            x_t=torch.randn((n_samples,self.in_channels,self.image_size,self.image_size)).to(device)
+        else: 
+            x_t=noise_seed 
+        if interp: 
+            interp_noise_xt = torch.zeros([*list(x_t.shape), self.timesteps-1, 2])
+        
+        x_t_cat = torch.tensor([])
         for i in tqdm(range(self.timesteps-1,-1,-1),desc="Sampling"):
             noise=torch.randn_like(x_t).to(device)
-            t=torch.tensor([i for _ in range(n_samples)]).to(device)
+            t=torch.tensor([i for _ in range(n_samples)]).to(device)  #generate t (shape = n_samples; with values all set to i (step))
 
             if clipped_reverse_diffusion:
                 x_t=self._reverse_diffusion_with_clip(x_t,t,noise)
             else:
                 x_t=self._reverse_diffusion(x_t,t,noise)
-
+            
+            if interp: 
+                interp_noise_xt[:,:,:,:,i-1,0] = noise
+                interp_noise_xt[:,:,:,:,i-1,1] = x_t
+            
+            x_t_cat = torch.cat([x_t_cat, x_t.unsqueeze(1).cpu()], dim=1)
+                                 
+        if interp: 
+            os.makedirs("DDM_sample_noise_results",exist_ok=True)
+            noise_out_dict = {"seed_noise": x_t, "noise_i": interp_noise_xt}
+            if noise_seed is None:
+                noise_out_fname = "DDM_sample_noise_results/noise_in_samples_{:0>8}.pt".format(n_samples)
+            else: 
+                noise_out_fname = "DDM_sample_noise_results/noise_in_samples_seedsSet.pt"
+            torch.save(noise_out_dict, noise_out_fname)
         x_t=(x_t+1.)/2. #[-1,1] to [0,1]
 
-        return x_t
-    
+        return x_t, x_t_cat
+
+
     def _cosine_variance_schedule(self,timesteps,epsilon= 0.008):
         steps=torch.linspace(0,timesteps,steps=timesteps+1,dtype=torch.float32)
         f_t=torch.cos(((steps/timesteps+epsilon)/(1.0+epsilon))*math.pi*0.5)**2
@@ -58,7 +81,7 @@ class MNISTDiffusion(nn.Module):
     def _forward_diffusion(self,x_0,t,noise):
         assert x_0.shape==noise.shape
         #q(x_{t}|x_{t-1})
-        return self.sqrt_alphas_cumprod.gather(-1,t).reshape(x_0.shape[0],1,1,1)*x_0+ \
+        return self.sqrt_alphas_cumprod.gather(-1,t).reshape(x_0.shape[0],1,1,1)*x_0 + \
                 self.sqrt_one_minus_alphas_cumprod.gather(-1,t).reshape(x_0.shape[0],1,1,1)*noise
 
 
