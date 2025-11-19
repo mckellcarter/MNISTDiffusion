@@ -1,0 +1,45 @@
+# Git files
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Training outputs (upload separately to save space)
+results/*.pt
+results/*.png
+jenny_*/
+test_outputs/
+test_results/
+direct_decoder_data/
+
+# MNIST data (downloads automatically)
+mnist_data/
+
+# Documentation (not needed in container)
+*.md
+LICENSE.md
+
+# Docker
+Dockerfile
+.dockerignore
