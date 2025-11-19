@@ -1,4 +1,7 @@
-torch
-torchvision
-tqdm
-argparse
+# PyTorch with CUDA 12.4 support for RTX 4070/5080
+torch>=2.5.0
+torchvision>=0.20.0
+tqdm>=4.66.0
+
+# Note: For CPU-only or different CUDA versions, install PyTorch separately:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
