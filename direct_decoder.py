@@ -1,17 +1,17 @@
 import torch
 import torch.nn as nn
-from unet import ResidualBottleneck, DecoderBlock
+from unet import ResidualBottleneck, TimeMLP
 
 
 class DirectEncoder(nn.Module):
     """
-    Wrapper around pretrained Unet encoder to extract bottleneck features and skip connections.
-    No timestep conditioning (t=None).
+    Frozen encoder from pretrained DDPM UNet.
+    Processes input WITH timestep conditioning (uses pretrained time conditioning).
     """
     def __init__(self, pretrained_unet):
         super().__init__()
-        # Extract encoder components from pretrained Unet
         self.init_conv = pretrained_unet.init_conv
+        self.time_embedding = pretrained_unet.time_embedding
         self.encoder_blocks = pretrained_unet.encoder_blocks
         self.mid_block = pretrained_unet.mid_block
 
@@ -19,21 +19,22 @@ class DirectEncoder(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
 
-    def forward(self, x):
+    def forward(self, x, t):
         """
         Args:
-            x: Input noise tensor [B, 1, 28, 28]
-
+            x: Input noisy images [B, 1, 28, 28]
+            t: Timestep tensor [B]
         Returns:
-            bottleneck_features: [B, 128, 7, 7]
-            encoder_shortcuts: List of skip connection tensors
+            bottleneck_features: Features at bottleneck [B, 256, 7, 7]
+            encoder_shortcuts: Skip connections from each encoder block
         """
         x = self.init_conv(x)
+        t_emb = self.time_embedding(t)  # Create timestep embeddings using pretrained embedding
 
-        # Collect skip connections (no timestep conditioning)
+        # Collect skip connections (WITH timestep conditioning)
         encoder_shortcuts = []
         for encoder_block in self.encoder_blocks:
-            x, x_shortcut = encoder_block(x, t=None)  # t=None for timestep-agnostic
+            x, x_shortcut = encoder_block(x, t=t_emb)  # Pass timestep embeddings
             encoder_shortcuts.append(x_shortcut)
 
         # Process through mid block
@@ -47,51 +48,74 @@ class DirectEncoder(nn.Module):
 
 class DirectDecoder(nn.Module):
     """
-    Direct decoder that maps from encoder features to clean images.
-    Similar to Unet decoder but WITHOUT timestep conditioning (no TimeMLP).
+    Direct decoder WITH timestep conditioning.
+    Maps from encoder features to denoised images, conditioned on current timestep.
     """
-    def __init__(self, base_dim=32, dim_mults=[2, 4], in_channels=1):
+    def __init__(self, base_dim=32, dim_mults=[2, 4], in_channels=1, time_embedding_dim=256, max_timesteps=1000):
         super().__init__()
+
+        self.time_embedding_dim = time_embedding_dim
+        self.max_timesteps = max_timesteps
+
+        # Timestep embedding layer (sinusoidal embeddings)
+        self.time_embedding = nn.Sequential(
+            nn.Linear(time_embedding_dim, time_embedding_dim),
+            nn.SiLU(),
+            nn.Linear(time_embedding_dim, time_embedding_dim)
+        )
 
         self.channels = self._cal_channels(base_dim, dim_mults)
 
-        # Build decoder blocks (similar to Unet but no time_embedding_dim)
+        # Build decoder blocks WITH timestep conditioning
+        # Note: decoder blocks go from high channels to low, so we swap in/out when reversing
         self.decoder_blocks = nn.ModuleList([
-            SimpleDecoderBlock(c[1], c[0]) for c in self.channels[::-1]
+            DirectDecoderBlock(out_channels, in_channels, time_embedding_dim)
+            for in_channels, out_channels in self.channels[::-1]
         ])
 
-        # Final convolution to image
-        self.final_conv = nn.Conv2d(
-            in_channels=self.channels[0][0] // 2,
-            out_channels=in_channels,
-            kernel_size=1
-        )
+        # Final convolution (from base_dim//2 channels to output channels)
+        self.final_conv = nn.Conv2d(base_dim // 2, in_channels, kernel_size=1)
 
-    def forward(self, bottleneck_features, encoder_shortcuts, hook_fn=None):
+    def forward(self, bottleneck_features, encoder_shortcuts, t):
         """
         Args:
-            bottleneck_features: [B, 128, 7, 7] from encoder mid_block
-            encoder_shortcuts: List of skip connection tensors
-            hook_fn: Optional function to manipulate bottleneck_features
-                     Signature: hook_fn(features) -> modified_features
-
+            bottleneck_features: Features from encoder [B, 256, 7, 7]
+            encoder_shortcuts: Skip connections from encoder (reversed order)
+            t: Timestep tensor [B]
         Returns:
-            x: Generated image [B, 1, 28, 28] in range [0, 1]
+            x: Denoised image [B, 1, 28, 28]
         """
+        # Create timestep embeddings
+        t_emb = self._get_timestep_embedding(t)  # [B, time_embedding_dim]
+        t_emb = self.time_embedding(t_emb)       # [B, time_embedding_dim]
+
         x = bottleneck_features
 
-        # Apply hook if provided (for feature space manipulation)
-        if hook_fn is not None:
-            x = hook_fn(x)
-
-        # Decode with skip connections
-        for decoder_block, shortcut in zip(self.decoder_blocks, encoder_shortcuts):
-            x = decoder_block(x, shortcut)
+        # Process through decoder blocks with timestep conditioning
+        for idx, decoder_block in enumerate(self.decoder_blocks):
+            x_shortcut = encoder_shortcuts[idx]
+            x = decoder_block(x, x_shortcut, t_emb)
 
         # Final convolution
         x = self.final_conv(x)
 
         return x
+
+    def _get_timestep_embedding(self, timesteps):
+        """
+        Create sinusoidal timestep embeddings.
+        Args:
+            timesteps: Tensor of shape [B] containing timestep values
+        Returns:
+            embedding: Tensor of shape [B, time_embedding_dim]
+        """
+        device = timesteps.device
+        half_dim = self.time_embedding_dim // 2
+        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = timesteps.float()[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        return emb
 
     def _cal_channels(self, base_dim, dim_mults):
         dims = [base_dim * x for x in dim_mults]
@@ -102,120 +126,121 @@ class DirectDecoder(nn.Module):
         return channels
 
 
-class SimpleDecoderBlock(nn.Module):
+class DirectDecoderBlock(nn.Module):
     """
-    Decoder block WITHOUT timestep conditioning (no TimeMLP).
-    Mirrors DecoderBlock from unet.py but simplified.
+    Decoder block WITH timestep conditioning (includes TimeMLP).
+    Matches DecoderBlock from unet.py exactly.
     """
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, time_embedding_dim):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
 
-        # Conv blocks (same as DecoderBlock but no TimeMLP)
+        # Conv blocks - matching original DecoderBlock
         self.conv0 = nn.Sequential(
             *[ResidualBottleneck(in_channels, in_channels) for i in range(3)],
             ResidualBottleneck(in_channels, in_channels // 2)
         )
 
+        # Timestep conditioning
+        self.time_mlp = TimeMLP(
+            embedding_dim=time_embedding_dim,
+            hidden_dim=in_channels,
+            out_dim=in_channels // 2
+        )
+
         self.conv1 = ResidualBottleneck(in_channels // 2, out_channels // 2)
 
-    def forward(self, x, x_shortcut):
+    def forward(self, x, x_shortcut, t_emb):
         """
         Args:
-            x: Input features
-            x_shortcut: Skip connection from encoder
-
+            x: Input features [B, C_in, H, W]
+            x_shortcut: Skip connection from encoder [B, C_in, H, W]
+            t_emb: Timestep embedding [B, time_embedding_dim]
         Returns:
-            x: Upsampled and processed features
+            x: Upsampled and processed features [B, C_out, 2H, 2W]
         """
         x = self.upsample(x)
         x = torch.cat([x, x_shortcut], dim=1)
         x = self.conv0(x)
-        # No TimeMLP here (difference from original DecoderBlock)
+
+        # Apply timestep conditioning
+        x = self.time_mlp(x, t_emb)
+
         x = self.conv1(x)
         return x
 
 
 class DirectDiffusion(nn.Module):
     """
-    Combined model: Frozen encoder + trainable direct decoder.
-    This is the main model for training and inference.
+    Complete direct decoder model: frozen encoder + trainable timestep-conditioned decoder.
+    Both encoder and decoder receive timestep information.
     """
-    def __init__(self, pretrained_unet, base_dim=32, dim_mults=[2, 4]):
+    def __init__(self, pretrained_unet, base_dim=32, dim_mults=[2, 4], time_embedding_dim=256, max_timesteps=1000):
         super().__init__()
 
-        # Frozen encoder
+        # Frozen encoder (but still uses timestep conditioning)
         self.encoder = DirectEncoder(pretrained_unet)
 
-        # Trainable decoder
-        self.decoder = DirectDecoder(base_dim=base_dim, dim_mults=dim_mults, in_channels=1)
+        # Trainable decoder with timestep conditioning
+        self.decoder = DirectDecoder(
+            base_dim=base_dim,
+            dim_mults=dim_mults,
+            in_channels=1,
+            time_embedding_dim=time_embedding_dim,
+            max_timesteps=max_timesteps
+        )
 
-    def forward(self, noise, hook_fn=None):
+        # Hook for feature manipulation (attribution analysis)
+        self.hook_fn = None
+
+    def forward(self, x, t):
         """
         Args:
-            noise: Random noise [B, 1, 28, 28]
-            hook_fn: Optional hook for feature manipulation
-
+            x: Noisy input images [B, 1, 28, 28]
+            t: Current timestep [B]
         Returns:
-            Generated image [B, 1, 28, 28] in range [0, 1]
+            x_denoised: Partially denoised images [B, 1, 28, 28]
         """
-        # Encode (frozen)
-        with torch.no_grad():
-            bottleneck_features, encoder_shortcuts = self.encoder(noise)
+        # Encode with timestep conditioning (frozen)
+        bottleneck_features, encoder_shortcuts = self.encoder(x, t)
 
-        # Decode (trainable, with optional hook)
-        output = self.decoder(bottleneck_features, encoder_shortcuts, hook_fn=hook_fn)
+        # Apply hook if registered (for attribution analysis)
+        if self.hook_fn is not None:
+            bottleneck_features = self.hook_fn(bottleneck_features)
 
-        return output
+        # Decode with timestep conditioning (trainable)
+        x_denoised = self.decoder(bottleneck_features, encoder_shortcuts, t)
+
+        return x_denoised
+
+    def register_hook(self, hook_fn):
+        """Register a hook function to manipulate bottleneck features."""
+        self.hook_fn = hook_fn
+
+    def clear_hook(self):
+        """Clear the registered hook."""
+        self.hook_fn = None
 
     def load_decoder_from_pretrained(self, pretrained_unet):
         """
-        Initialize decoder weights from pretrained Unet decoder.
-        This provides a warm start for training.
+        Initialize decoder weights from pretrained UNet decoder (warm start).
         """
+        print("Initializing decoder from pretrained UNet decoder weights...")
+
         # Copy decoder block weights
-        for i, (new_block, old_block) in enumerate(zip(
-            self.decoder.decoder_blocks,
-            pretrained_unet.decoder_blocks
-        )):
-            # Copy conv0 and conv1 weights
-            new_block.conv0.load_state_dict(old_block.conv0.state_dict())
-            new_block.conv1.load_state_dict(old_block.conv1.state_dict())
-            # Note: old_block.time_mlp is not copied (we don't have it)
+        for i, (direct_block, pretrained_block) in enumerate(
+            zip(self.decoder.decoder_blocks, pretrained_unet.decoder_blocks)
+        ):
+            # Copy conv0
+            direct_block.conv0.load_state_dict(pretrained_block.conv0.state_dict())
+
+            # Copy time_mlp
+            direct_block.time_mlp.load_state_dict(pretrained_block.time_mlp.state_dict())
+
+            # Copy conv1
+            direct_block.conv1.load_state_dict(pretrained_block.conv1.state_dict())
 
         # Copy final conv
         self.decoder.final_conv.load_state_dict(pretrained_unet.final_conv.state_dict())
 
-        print("Initialized DirectDecoder from pretrained Unet decoder weights")
-
-
-if __name__ == "__main__":
-    # Test the architecture
-    from model import MNISTDiffusion
-
-    print("Creating pretrained DDPM...")
-    ddpm = MNISTDiffusion(timesteps=1000, image_size=28, in_channels=1, base_dim=64, dim_mults=[2, 4])
-
-    print("Creating DirectDiffusion model...")
-    direct_model = DirectDiffusion(ddpm.model, base_dim=64, dim_mults=[2, 4])
-
-    print("Loading pretrained decoder weights...")
-    direct_model.load_decoder_from_pretrained(ddpm.model)
-
-    print("\nTesting forward pass...")
-    noise = torch.randn(4, 1, 28, 28)
-    output = direct_model(noise)
-
-    print(f"Input shape: {noise.shape}")
-    print(f"Output shape: {output.shape}")
-    print(f"Output range: [{output.min():.3f}, {output.max():.3f}]")
-
-    print("\nTesting with hook...")
-    def example_hook(features):
-        # Example: scale features
-        return features * 1.1
-
-    output_hooked = direct_model(noise, hook_fn=example_hook)
-    print(f"Hooked output shape: {output_hooked.shape}")
-
-    print("\nArchitecture test passed!")
+        print("Decoder initialization complete!")
