@@ -3,5 +3,8 @@ torch>=2.5.0
 torchvision>=0.20.0
 tqdm>=4.66.0
 
+# Perceptual loss for direct decoder training
+lpips>=0.1.4
+
 # Note: For CPU-only or different CUDA versions, install PyTorch separately:
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
