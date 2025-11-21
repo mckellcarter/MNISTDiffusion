@@ -3,8 +3,10 @@ import math
 import os
 import random
 
+import lpips
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from torch.optim import AdamW
@@ -58,8 +60,24 @@ def parse_args():
                         help='Random seed')
     parser.add_argument('--resume_ckpt', type=str, default=None,
                         help='Path to checkpoint to resume training')
+    parser.add_argument('--loss_mse_weight', type=float, default=0.1,
+                        help='Weight for MSE loss component')
+    parser.add_argument('--loss_lpips_weight', type=float, default=1.0,
+                        help='Weight for LPIPS loss component')
+    parser.add_argument('--lpips_net', type=str, default='alex', choices=['alex', 'vgg'],
+                        help='Backbone network for LPIPS (alex or vgg)')
 
     return parser.parse_args()
+
+
+def default_collate_fn(batch):
+    """
+    Default collate function - just stack tensors.
+    """
+    intermediate_states, images = zip(*batch)
+    intermediate_states = torch.stack(intermediate_states)
+    images = torch.stack(images)
+    return intermediate_states, images
 
 
 def create_dataloaders(data_path, batch_size, train_split=0.9, num_workers=4):
@@ -105,7 +123,8 @@ def create_dataloaders(data_path, batch_size, train_split=0.9, num_workers=4):
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=default_collate_fn
     )
 
     val_loader = DataLoader(
@@ -113,7 +132,8 @@ def create_dataloaders(data_path, batch_size, train_split=0.9, num_workers=4):
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=default_collate_fn
     )
 
     return train_loader, val_loader, target_timesteps
@@ -198,7 +218,13 @@ def main(parsed_args):
         anneal_strategy='cos'
     )
 
-    loss_fn = nn.MSELoss(reduction='mean')
+    # Loss functions
+    loss_fn_mse = nn.MSELoss(reduction='mean')
+    loss_fn_lpips = lpips.LPIPS(net=parsed_args.lpips_net).to(device)
+    loss_fn_lpips.requires_grad_(False)  # Freeze LPIPS weights
+
+    print(f"Using hybrid loss: {parsed_args.loss_mse_weight}*MSE + "
+          f"{parsed_args.loss_lpips_weight}*LPIPS({parsed_args.lpips_net})")
 
     # Create output directory
     os.makedirs(parsed_args.output_dir, exist_ok=True)
@@ -236,7 +262,9 @@ def main(parsed_args):
     for epoch in range(start_epoch, parsed_args.epochs):
         # Training
         model.train()
-        train_loss = 0.0
+        train_loss_total = 0.0
+        train_loss_mse = 0.0
+        train_loss_lpips = 0.0
 
         for i, (intermediate_states_batch, target_images) in enumerate(train_loader):
             # intermediate_states_batch: [B, 5, 1, 28, 28]
@@ -256,8 +284,20 @@ def main(parsed_args):
             # Forward pass
             pred_images = model(noisy_images, t)
 
-            # Loss
-            loss = loss_fn(pred_images, target_images)
+            # Hybrid loss computation
+            mse_loss = loss_fn_mse(pred_images, target_images)
+
+            # LPIPS requires larger images (min ~32x32) - upsample to 64x64 and convert to RGB
+            pred_upsampled = F.interpolate(
+                pred_images, size=(64, 64), mode='bilinear', align_corners=False)
+            target_upsampled = F.interpolate(
+                target_images, size=(64, 64), mode='bilinear', align_corners=False)
+            pred_rgb = pred_upsampled.repeat(1, 3, 1, 1)
+            target_rgb = target_upsampled.repeat(1, 3, 1, 1)
+            lpips_loss = loss_fn_lpips(pred_rgb, target_rgb).mean()
+
+            loss = (parsed_args.loss_mse_weight * mse_loss +
+                    parsed_args.loss_lpips_weight * lpips_loss)
 
             # Backward
             loss.backward()
@@ -269,19 +309,26 @@ def main(parsed_args):
             if global_steps % parsed_args.model_ema_steps == 0:
                 model_ema.update_parameters(model)
 
-            train_loss += loss.item()
+            train_loss_total += loss.item()
+            train_loss_mse += mse_loss.item()
+            train_loss_lpips += lpips_loss.item()
             global_steps += 1
 
             # Logging
             if i % parsed_args.log_freq == 0:
                 print(f"Epoch[{epoch+1}/{parsed_args.epochs}], Step[{i}/{len(train_loader)}], "
-                      f"Loss:{loss.item():.5f}, LR:{scheduler.get_last_lr()[0]:.6f}")
+                      f"Loss:{loss.item():.5f} (MSE:{mse_loss.item():.5f}, "
+                      f"LPIPS:{lpips_loss.item():.5f}), LR:{scheduler.get_last_lr()[0]:.6f}")
 
-        train_loss /= len(train_loader)
+        train_loss_total /= len(train_loader)
+        train_loss_mse /= len(train_loader)
+        train_loss_lpips /= len(train_loader)
 
         # Validation
         model.eval()
-        val_loss = 0.0
+        val_loss_total = 0.0
+        val_loss_mse = 0.0
+        val_loss_lpips = 0.0
 
         with torch.no_grad():
             for intermediate_states_batch, target_images in val_loader:
@@ -298,14 +345,35 @@ def main(parsed_args):
                 t = target_timesteps[timestep_indices]
 
                 pred_images = model(noisy_images, t)
-                loss = loss_fn(pred_images, target_images)
-                val_loss += loss.item()
 
-        val_loss /= len(val_loader)
+                # Hybrid loss computation
+                mse_loss = loss_fn_mse(pred_images, target_images)
+
+                # LPIPS requires larger images (min ~32x32) - upsample to 64x64 and convert to RGB
+                pred_upsampled = F.interpolate(
+                    pred_images, size=(64, 64), mode='bilinear', align_corners=False)
+                target_upsampled = F.interpolate(
+                    target_images, size=(64, 64), mode='bilinear', align_corners=False)
+                pred_rgb = pred_upsampled.repeat(1, 3, 1, 1)
+                target_rgb = target_upsampled.repeat(1, 3, 1, 1)
+                lpips_loss = loss_fn_lpips(pred_rgb, target_rgb).mean()
+
+                loss = (parsed_args.loss_mse_weight * mse_loss +
+                        parsed_args.loss_lpips_weight * lpips_loss)
+
+                val_loss_total += loss.item()
+                val_loss_mse += mse_loss.item()
+                val_loss_lpips += lpips_loss.item()
+
+        val_loss_total /= len(val_loader)
+        val_loss_mse /= len(val_loader)
+        val_loss_lpips /= len(val_loader)
 
         print(f"\nEpoch {epoch+1}/{parsed_args.epochs} Summary:")
-        print(f"  Train Loss: {train_loss:.5f}")
-        print(f"  Val Loss:   {val_loss:.5f}\n")
+        print(f"  Train Loss: {train_loss_total:.5f} "
+              f"(MSE: {train_loss_mse:.5f}, LPIPS: {train_loss_lpips:.5f})")
+        print(f"  Val Loss:   {val_loss_total:.5f} "
+              f"(MSE: {val_loss_mse:.5f}, LPIPS: {val_loss_lpips:.5f})\n")
 
         # Save checkpoint
         ckpt = {
@@ -314,17 +382,19 @@ def main(parsed_args):
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "global_steps": global_steps,
-            "val_loss": val_loss
+            "val_loss": val_loss_total,
+            "val_loss_mse": val_loss_mse,
+            "val_loss_lpips": val_loss_lpips
         }
 
         torch.save(ckpt, os.path.join(parsed_args.output_dir, f'ckpt_epoch_{epoch+1:03d}.pt'))
 
         # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_loss_total < best_val_loss:
+            best_val_loss = val_loss_total
             torch.save(ckpt, os.path.join(parsed_args.output_dir,
                                           'best_model.pt'))
-            print(f"  Saved best model (val_loss: {val_loss:.5f})")
+            print(f"  Saved best model (val_loss: {val_loss_total:.5f})")
 
         # Generate samples using EMA model
         model_ema.eval()
