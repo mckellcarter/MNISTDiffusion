@@ -29,9 +29,11 @@ ENV/
 results/*.pt
 results/*.png
 jenny_*/
+!jenny_6x0/steps_00046900.pt
 test_outputs/
 test_results/
 direct_decoder_data/
+!direct_decoder_data/training_data.pt
 
 # MNIST data (downloads automatically)
 mnist_data/
