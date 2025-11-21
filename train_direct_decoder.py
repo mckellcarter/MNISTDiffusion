@@ -284,8 +284,8 @@ def main(parsed_args):
         model_ema.eval()
         sample_noise = torch.randn(parsed_args.n_samples, 1, 28, 28).to(device)
 
-        # Use t=1000 (pure noise) for sampling
-        sample_t = torch.full((parsed_args.n_samples,), 1000, device=device, dtype=torch.long)
+        # Use t=999 (0-indexed max timestep for pure noise)
+        sample_t = torch.full((parsed_args.n_samples,), 999, device=device, dtype=torch.long)
 
         with torch.no_grad():
             samples = model_ema.module(sample_noise, sample_t)

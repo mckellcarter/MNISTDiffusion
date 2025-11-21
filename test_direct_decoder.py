@@ -1,9 +1,11 @@
-import torch
-from direct_decoder import DirectDiffusion
-from model import MNISTDiffusion
-from torchvision.utils import save_image
 import argparse
 import os
+
+import torch
+from torchvision.utils import save_image
+
+from direct_decoder import DirectDiffusion
+from model import MNISTDiffusion
 
 
 def parse_args():
@@ -97,9 +99,11 @@ def main(args):
     # 1. Standard generation (no hook)
     print("1. Standard generation (no hook)...")
     noise = torch.randn(args.n_samples, 1, 28, 28).to(device)
+    # Use t=999 (0-indexed max timestep for pure noise)
+    t = torch.full((args.n_samples,), 999, device=device, dtype=torch.long)
 
     with torch.no_grad():
-        samples_standard = model(noise, hook_fn=None)
+        samples_standard = model(noise, t)
 
     save_image(
         samples_standard,
@@ -114,8 +118,10 @@ def main(args):
     def amplify_hook(features):
         return features * 1.2
 
+    model.register_hook(amplify_hook)
     with torch.no_grad():
-        samples_amplified = model(noise, hook_fn=amplify_hook)
+        samples_amplified = model(noise, t)
+    model.clear_hook()
 
     save_image(
         samples_amplified,
@@ -130,8 +136,10 @@ def main(args):
     def dampen_hook(features):
         return features * 0.8
 
+    model.register_hook(dampen_hook)
     with torch.no_grad():
-        samples_dampened = model(noise, hook_fn=dampen_hook)
+        samples_dampened = model(noise, t)
+    model.clear_hook()
 
     save_image(
         samples_dampened,
@@ -146,8 +154,10 @@ def main(args):
     def bias_hook(features):
         return features + 0.1
 
+    model.register_hook(bias_hook)
     with torch.no_grad():
-        samples_biased = model(noise, hook_fn=bias_hook)
+        samples_biased = model(noise, t)
+    model.clear_hook()
 
     save_image(
         samples_biased,
@@ -161,6 +171,7 @@ def main(args):
     print("5. Noise interpolation...")
     noise1 = torch.randn(1, 1, 28, 28).to(device)
     noise2 = torch.randn(1, 1, 28, 28).to(device)
+    t_interp = torch.full((1,), 999, device=device, dtype=torch.long)
 
     interpolation_steps = 10
     alphas = torch.linspace(0, 1, interpolation_steps)
@@ -169,7 +180,7 @@ def main(args):
     for alpha in alphas:
         noise_interp = (1 - alpha) * noise1 + alpha * noise2
         with torch.no_grad():
-            sample = model(noise_interp, hook_fn=None)
+            sample = model(noise_interp, t_interp)
         interpolated_samples.append(sample)
 
     interpolated_grid = torch.cat(interpolated_samples, dim=0)
