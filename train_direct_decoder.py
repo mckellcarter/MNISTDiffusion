@@ -198,12 +198,12 @@ def main(parsed_args):
             target_images = target_images.to(device)
 
             # Randomly select one timestep per sample in batch
-            timestep_indices = torch.randint(0, 5, (intermediate_states_batch.shape[0],), device=device)
+            batch_size = intermediate_states_batch.shape[0]
+            timestep_indices = torch.randint(0, 5, (batch_size,), device=device)
 
             # Extract the corresponding noisy image and timestep for each sample
-            batch_size = intermediate_states_batch.shape[0]
-            noisy_images = intermediate_states_batch[torch.arange(batch_size), timestep_indices]  # [B, 1, 28, 28]
-            t = target_timesteps[timestep_indices].to(device)  # [B]
+            noisy_images = intermediate_states_batch[torch.arange(batch_size, device=device), timestep_indices]  # [B, 1, 28, 28]
+            t = target_timesteps[timestep_indices]  # [B]
 
             # Forward pass
             pred_images = model(noisy_images, t)
@@ -241,12 +241,12 @@ def main(parsed_args):
                 target_images = target_images.to(device)
 
                 # Randomly select one timestep per sample in batch
-                timestep_indices = torch.randint(0, 5, (intermediate_states_batch.shape[0],), device=device)
+                batch_size = intermediate_states_batch.shape[0]
+                timestep_indices = torch.randint(0, 5, (batch_size,), device=device)
 
                 # Extract the corresponding noisy image and timestep for each sample
-                batch_size = intermediate_states_batch.shape[0]
-                noisy_images = intermediate_states_batch[torch.arange(batch_size), timestep_indices]
-                t = target_timesteps[timestep_indices].to(device)
+                noisy_images = intermediate_states_batch[torch.arange(batch_size, device=device), timestep_indices]
+                t = target_timesteps[timestep_indices]
 
                 pred_images = model(noisy_images, t)
                 loss = loss_fn(pred_images, target_images)
