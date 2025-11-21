@@ -29,21 +29,35 @@ def reset_rand(seed=8675309):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Training Direct Decoder")
-    parser.add_argument('--ddpm_ckpt', type=str, required=True, help='Path to pretrained DDPM checkpoint')
-    parser.add_argument('--data_path', type=str, required=True, help='Path to pre-generated training data')
+    parser.add_argument('--ddpm_ckpt', type=str, required=True,
+                        help='Path to pretrained DDPM checkpoint')
+    parser.add_argument('--data_path', type=str, required=True,
+                        help='Path to pre-generated training data')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--train_split', type=float, default=0.9, help='Train/val split ratio')
-    parser.add_argument('--model_base_dim', type=int, default=64, help='Base dim of UNet')
-    parser.add_argument('--timesteps', type=int, default=1000, help='DDPM timesteps (for loading model)')
-    parser.add_argument('--model_ema_steps', type=int, default=10, help='EMA update interval')
-    parser.add_argument('--model_ema_decay', type=float, default=0.995, help='EMA decay rate')
-    parser.add_argument('--log_freq', type=int, default=10, help='Logging frequency')
-    parser.add_argument('--n_samples', type=int, default=36, help='Number of samples to generate per epoch')
-    parser.add_argument('--output_dir', type=str, default='direct_decoder_results', help='Output directory')
-    parser.add_argument('--cpu', action='store_true', help='Force CPU training')
-    parser.add_argument('--seed', type=int, default=8675309, help='Random seed')
+    parser.add_argument('--train_split', type=float, default=0.9,
+                        help='Train/val split ratio')
+    parser.add_argument('--model_base_dim', type=int, default=64,
+                        help='Base dim of UNet')
+    parser.add_argument('--timesteps', type=int, default=1000,
+                        help='DDPM timesteps (for loading model)')
+    parser.add_argument('--model_ema_steps', type=int, default=10,
+                        help='EMA update interval')
+    parser.add_argument('--model_ema_decay', type=float, default=0.995,
+                        help='EMA decay rate')
+    parser.add_argument('--log_freq', type=int, default=10,
+                        help='Logging frequency')
+    parser.add_argument('--n_samples', type=int, default=36,
+                        help='Number of samples to generate per epoch')
+    parser.add_argument('--output_dir', type=str, default='direct_decoder_results',
+                        help='Output directory')
+    parser.add_argument('--cpu', action='store_true',
+                        help='Force CPU training')
+    parser.add_argument('--seed', type=int, default=8675309,
+                        help='Random seed')
+    parser.add_argument('--resume_ckpt', type=str, default=None,
+                        help='Path to checkpoint to resume training')
 
     return parser.parse_args()
 
@@ -62,12 +76,14 @@ def create_dataloaders(data_path, batch_size, train_split=0.9, num_workers=4):
     target_timesteps_raw = data['metadata']['target_timesteps']  # [1000, 500, 100, 50, 10]
 
     # Convert to 0-indexed (nn.Embedding expects [0, timesteps-1])
-    target_timesteps = [t - 1 if t > 0 else 0 for t in target_timesteps_raw]  # [999, 499, 99, 49, 9]
+    # [999, 499, 99, 49, 9]
+    target_timesteps = [t - 1 if t > 0 else 0 for t in target_timesteps_raw]
 
     print(f"Loaded {n_samples} samples")
     print(f"Noise shape: {noise.shape}, range: [{noise.min():.3f}, {noise.max():.3f}]")
     print(f"Images shape: {images.shape}, range: [{images.min():.3f}, {images.max():.3f}]")
-    print(f"Intermediate states shape: {intermediate_states.shape} at timesteps {target_timesteps_raw} (using 0-indexed: {target_timesteps})")
+    print(f"Intermediate states shape: {intermediate_states.shape} at timesteps "
+          f"{target_timesteps_raw} (using 0-indexed: {target_timesteps})")
 
     # Create dataset with intermediate states and timesteps
     dataset = TensorDataset(intermediate_states, images)
@@ -187,11 +203,37 @@ def main(parsed_args):
     # Create output directory
     os.makedirs(parsed_args.output_dir, exist_ok=True)
 
-    # Training loop
+    # Resume from checkpoint if specified
+    start_epoch = 0
     global_steps = 0
     best_val_loss = float('inf')
 
-    for epoch in range(parsed_args.epochs):
+    if parsed_args.resume_ckpt:
+        print(f"Resuming from checkpoint: {parsed_args.resume_ckpt}")
+        resume_ckpt = torch.load(parsed_args.resume_ckpt, map_location=device)
+
+        model.load_state_dict(resume_ckpt['model'])
+        model_ema.load_state_dict(resume_ckpt['model_ema'])
+        optimizer.load_state_dict(resume_ckpt['optimizer'])
+
+        start_epoch = resume_ckpt['epoch'] + 1
+        global_steps = resume_ckpt['global_steps']
+        best_val_loss = resume_ckpt.get('val_loss', float('inf'))
+
+        print(f"Resumed from epoch {resume_ckpt['epoch'] + 1}, global_steps "
+              f"{global_steps}, best_val_loss {best_val_loss:.5f}")
+
+        # Restore scheduler state
+        scheduler.last_epoch = global_steps - 1
+        # pylint: disable=protected-access
+        scheduler._step_count = global_steps
+        scheduler.step()
+    else:
+        start_epoch = 0
+        global_steps = 0
+        best_val_loss = float('inf')
+
+    for epoch in range(start_epoch, parsed_args.epochs):
         # Training
         model.train()
         train_loss = 0.0
@@ -206,7 +248,9 @@ def main(parsed_args):
             timestep_indices = torch.randint(0, 5, (batch_size,), device=device)
 
             # Extract the corresponding noisy image and timestep for each sample
-            noisy_images = intermediate_states_batch[torch.arange(batch_size, device=device), timestep_indices]  # [B, 1, 28, 28]
+            # [B, 1, 28, 28]
+            noisy_images = intermediate_states_batch[
+                torch.arange(batch_size, device=device), timestep_indices]
             t = target_timesteps[timestep_indices]  # [B]
 
             # Forward pass
@@ -249,7 +293,8 @@ def main(parsed_args):
                 timestep_indices = torch.randint(0, 5, (batch_size,), device=device)
 
                 # Extract the corresponding noisy image and timestep for each sample
-                noisy_images = intermediate_states_batch[torch.arange(batch_size, device=device), timestep_indices]
+                noisy_images = intermediate_states_batch[
+                    torch.arange(batch_size, device=device), timestep_indices]
                 t = target_timesteps[timestep_indices]
 
                 pred_images = model(noisy_images, t)
@@ -277,7 +322,8 @@ def main(parsed_args):
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(ckpt, os.path.join(parsed_args.output_dir, 'best_model.pt'))
+            torch.save(ckpt, os.path.join(parsed_args.output_dir,
+                                          'best_model.pt'))
             print(f"  Saved best model (val_loss: {val_loss:.5f})")
 
         # Generate samples using EMA model
