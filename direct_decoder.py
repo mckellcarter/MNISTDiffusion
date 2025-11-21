@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn
 from unet import ResidualBottleneck, TimeMLP
 
 
@@ -51,7 +51,9 @@ class DirectDecoder(nn.Module):
     Direct decoder WITH timestep conditioning.
     Maps from encoder features to denoised images, conditioned on current timestep.
     """
-    def __init__(self, base_dim=32, dim_mults=[2, 4], in_channels=1, time_embedding_dim=256, max_timesteps=1000):
+    def __init__(self, base_dim=32, dim_mults=None, in_channels=1, time_embedding_dim=256, max_timesteps=1000):
+        if dim_mults is None:
+            dim_mults = [2, 4]
         super().__init__()
 
         self.time_embedding_dim = time_embedding_dim
@@ -69,8 +71,8 @@ class DirectDecoder(nn.Module):
         # Build decoder blocks WITH timestep conditioning
         # Note: decoder blocks go from high channels to low, so we swap in/out when reversing
         self.decoder_blocks = nn.ModuleList([
-            DirectDecoderBlock(out_channels, in_channels, time_embedding_dim)
-            for in_channels, out_channels in self.channels[::-1]
+            DirectDecoderBlock(out_ch, in_ch, time_embedding_dim)
+            for in_ch, out_ch in self.channels[::-1]
         ])
 
         # Final convolution (from base_dim//2 channels to output channels)
@@ -175,7 +177,9 @@ class DirectDiffusion(nn.Module):
     Complete direct decoder model: frozen encoder + trainable timestep-conditioned decoder.
     Both encoder and decoder receive timestep information.
     """
-    def __init__(self, pretrained_unet, base_dim=32, dim_mults=[2, 4], time_embedding_dim=256, max_timesteps=1000):
+    def __init__(self, pretrained_unet, base_dim=32, dim_mults=None, time_embedding_dim=256, max_timesteps=1000):
+        if dim_mults is None:
+            dim_mults = [2, 4]
         super().__init__()
 
         # Frozen encoder (but still uses timestep conditioning)
@@ -228,8 +232,8 @@ class DirectDiffusion(nn.Module):
         print("Initializing decoder from pretrained UNet decoder weights...")
 
         # Copy decoder block weights
-        for i, (direct_block, pretrained_block) in enumerate(
-            zip(self.decoder.decoder_blocks, pretrained_unet.decoder_blocks)
+        for direct_block, pretrained_block in zip(
+            self.decoder.decoder_blocks, pretrained_unet.decoder_blocks
         ):
             # Copy conv0
             direct_block.conv0.load_state_dict(pretrained_block.conv0.state_dict())
