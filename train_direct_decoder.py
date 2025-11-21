@@ -58,12 +58,15 @@ def create_dataloaders(data_path, batch_size, train_split=0.9, num_workers=4):
     images = data['images']
     intermediate_states = data['intermediate_states']  # [N, 5, 1, 28, 28]
     n_samples = data['n_samples']
-    target_timesteps = data['metadata']['target_timesteps']  # [1000, 500, 100, 50, 10]
+    target_timesteps_raw = data['metadata']['target_timesteps']  # [1000, 500, 100, 50, 10]
+
+    # Convert to 0-indexed (nn.Embedding expects [0, timesteps-1])
+    target_timesteps = [t - 1 if t > 0 else 0 for t in target_timesteps_raw]  # [999, 499, 99, 49, 9]
 
     print(f"Loaded {n_samples} samples")
     print(f"Noise shape: {noise.shape}, range: [{noise.min():.3f}, {noise.max():.3f}]")
     print(f"Images shape: {images.shape}, range: [{images.min():.3f}, {images.max():.3f}]")
-    print(f"Intermediate states shape: {intermediate_states.shape} at timesteps {target_timesteps}")
+    print(f"Intermediate states shape: {intermediate_states.shape} at timesteps {target_timesteps_raw} (using 0-indexed: {target_timesteps})")
 
     # Create dataset with intermediate states and timesteps
     dataset = TensorDataset(intermediate_states, images)
@@ -96,7 +99,7 @@ def create_dataloaders(data_path, batch_size, train_split=0.9, num_workers=4):
         pin_memory=True
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, target_timesteps
 
 
 def main(parsed_args):
@@ -158,14 +161,14 @@ def main(parsed_args):
     model_ema = ExponentialMovingAverage(model, device=device, decay=1.0 - alpha)
 
     # Load data
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, target_timesteps = create_dataloaders(
         parsed_args.data_path,
         parsed_args.batch_size,
         parsed_args.train_split
     )
 
-    # Target timesteps from data generation
-    target_timesteps = torch.tensor([1000, 500, 100, 50, 10], dtype=torch.long, device=device)
+    # Convert to tensor on device
+    target_timesteps = torch.tensor(target_timesteps, dtype=torch.long, device=device)
 
     # Optimizer and scheduler
     # Only optimize decoder parameters (encoder is frozen)
