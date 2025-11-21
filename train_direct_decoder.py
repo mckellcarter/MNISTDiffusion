@@ -22,7 +22,8 @@ def reset_rand(seed=8675309):
     torch.manual_seed(seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
-    torch.use_deterministic_algorithms(True)
+    # Use warn_only=True to allow training on CUDA where some ops can't be deterministic
+    torch.use_deterministic_algorithms(True, warn_only=True)
     torch.backends.cudnn.deterministic = True
 
 
