@@ -60,10 +60,12 @@ def parse_args():
                         help='Random seed')
     parser.add_argument('--resume_ckpt', type=str, default=None,
                         help='Path to checkpoint to resume training')
-    parser.add_argument('--loss_mse_weight', type=float, default=0.1,
-                        help='Weight for MSE loss component')
+    parser.add_argument('--loss_huber_weight', type=float, default=0.1,
+                        help='Weight for Huber loss component')
     parser.add_argument('--loss_lpips_weight', type=float, default=1.0,
                         help='Weight for LPIPS loss component')
+    parser.add_argument('--huber_delta', type=float, default=1.0,
+                        help='Delta parameter for Huber loss (threshold between L1/L2)')
     parser.add_argument('--lpips_net', type=str, default='alex', choices=['alex', 'vgg'],
                         help='Backbone network for LPIPS (alex or vgg)')
 
@@ -219,12 +221,12 @@ def main(parsed_args):
     )
 
     # Loss functions
-    loss_fn_mse = nn.MSELoss(reduction='mean')
+    loss_fn_huber = nn.HuberLoss(reduction='mean', delta=parsed_args.huber_delta)
     loss_fn_lpips = lpips.LPIPS(net=parsed_args.lpips_net).to(device)
     loss_fn_lpips.requires_grad_(False)  # Freeze LPIPS weights
 
-    print(f"Using hybrid loss: {parsed_args.loss_mse_weight}*MSE + "
-          f"{parsed_args.loss_lpips_weight}*LPIPS({parsed_args.lpips_net})")
+    print(f"Using hybrid loss: {parsed_args.loss_huber_weight}*Huber(δ={parsed_args.huber_delta})"
+          f" + {parsed_args.loss_lpips_weight}*LPIPS({parsed_args.lpips_net})")
 
     # Create output directory
     os.makedirs(parsed_args.output_dir, exist_ok=True)
@@ -263,7 +265,7 @@ def main(parsed_args):
         # Training
         model.train()
         train_loss_total = 0.0
-        train_loss_mse = 0.0
+        train_loss_huber = 0.0
         train_loss_lpips = 0.0
 
         for i, (intermediate_states_batch, target_images) in enumerate(train_loader):
@@ -285,7 +287,7 @@ def main(parsed_args):
             pred_images = model(noisy_images, t)
 
             # Hybrid loss computation
-            mse_loss = loss_fn_mse(pred_images, target_images)
+            huber_loss = loss_fn_huber(pred_images, target_images)
 
             # LPIPS requires larger images (min ~32x32) - upsample to 64x64 and convert to RGB
             pred_upsampled = F.interpolate(
@@ -296,7 +298,7 @@ def main(parsed_args):
             target_rgb = target_upsampled.repeat(1, 3, 1, 1)
             lpips_loss = loss_fn_lpips(pred_rgb, target_rgb).mean()
 
-            loss = (parsed_args.loss_mse_weight * mse_loss +
+            loss = (parsed_args.loss_huber_weight * huber_loss +
                     parsed_args.loss_lpips_weight * lpips_loss)
 
             # Backward
@@ -310,24 +312,24 @@ def main(parsed_args):
                 model_ema.update_parameters(model)
 
             train_loss_total += loss.item()
-            train_loss_mse += mse_loss.item()
+            train_loss_huber += huber_loss.item()
             train_loss_lpips += lpips_loss.item()
             global_steps += 1
 
             # Logging
             if i % parsed_args.log_freq == 0:
                 print(f"Epoch[{epoch+1}/{parsed_args.epochs}], Step[{i}/{len(train_loader)}], "
-                      f"Loss:{loss.item():.5f} (MSE:{mse_loss.item():.5f}, "
+                      f"Loss:{loss.item():.5f} (Huber:{huber_loss.item():.5f}, "
                       f"LPIPS:{lpips_loss.item():.5f}), LR:{scheduler.get_last_lr()[0]:.6f}")
 
         train_loss_total /= len(train_loader)
-        train_loss_mse /= len(train_loader)
+        train_loss_huber /= len(train_loader)
         train_loss_lpips /= len(train_loader)
 
         # Validation
         model.eval()
         val_loss_total = 0.0
-        val_loss_mse = 0.0
+        val_loss_huber = 0.0
         val_loss_lpips = 0.0
 
         with torch.no_grad():
@@ -347,7 +349,7 @@ def main(parsed_args):
                 pred_images = model(noisy_images, t)
 
                 # Hybrid loss computation
-                mse_loss = loss_fn_mse(pred_images, target_images)
+                huber_loss = loss_fn_huber(pred_images, target_images)
 
                 # LPIPS requires larger images (min ~32x32) - upsample to 64x64 and convert to RGB
                 pred_upsampled = F.interpolate(
@@ -358,22 +360,22 @@ def main(parsed_args):
                 target_rgb = target_upsampled.repeat(1, 3, 1, 1)
                 lpips_loss = loss_fn_lpips(pred_rgb, target_rgb).mean()
 
-                loss = (parsed_args.loss_mse_weight * mse_loss +
+                loss = (parsed_args.loss_huber_weight * huber_loss +
                         parsed_args.loss_lpips_weight * lpips_loss)
 
                 val_loss_total += loss.item()
-                val_loss_mse += mse_loss.item()
+                val_loss_huber += huber_loss.item()
                 val_loss_lpips += lpips_loss.item()
 
         val_loss_total /= len(val_loader)
-        val_loss_mse /= len(val_loader)
+        val_loss_huber /= len(val_loader)
         val_loss_lpips /= len(val_loader)
 
         print(f"\nEpoch {epoch+1}/{parsed_args.epochs} Summary:")
         print(f"  Train Loss: {train_loss_total:.5f} "
-              f"(MSE: {train_loss_mse:.5f}, LPIPS: {train_loss_lpips:.5f})")
+              f"(Huber: {train_loss_huber:.5f}, LPIPS: {train_loss_lpips:.5f})")
         print(f"  Val Loss:   {val_loss_total:.5f} "
-              f"(MSE: {val_loss_mse:.5f}, LPIPS: {val_loss_lpips:.5f})\n")
+              f"(Huber: {val_loss_huber:.5f}, LPIPS: {val_loss_lpips:.5f})\n")
 
         # Save checkpoint
         ckpt = {
@@ -383,7 +385,7 @@ def main(parsed_args):
             "epoch": epoch,
             "global_steps": global_steps,
             "val_loss": val_loss_total,
-            "val_loss_mse": val_loss_mse,
+            "val_loss_huber": val_loss_huber,
             "val_loss_lpips": val_loss_lpips
         }
 
